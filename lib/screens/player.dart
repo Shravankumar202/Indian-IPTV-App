@@ -34,8 +34,10 @@ class _PlayerState extends State<Player> {
   bool _loading = true;
   bool _hasError = false;
   bool _showControls = false;
+  bool _closing = false;
 
   _ScreenMode _screenMode = _ScreenMode.fit;
+
   final FocusNode _focusNode = FocusNode();
   Timer? _hideTimer;
   int _initId = 0;
@@ -112,7 +114,7 @@ class _PlayerState extends State<Player> {
       await next.setLooping(false);
       await next.play();
 
-      if (!mounted) return;
+      if (!mounted || id != _initId) return;
 
       setState(() {
         _loading = false;
@@ -120,17 +122,27 @@ class _PlayerState extends State<Player> {
       });
 
       _scheduleHide();
+      _focusNode.requestFocus();
     } catch (_) {
       if (!mounted || id != _initId) {
         await next?.dispose();
         return;
       }
 
+      if (_controller == next) {
+        _controller = null;
+      }
+
+      next?.removeListener(_onVideoUpdate);
+      await next?.dispose();
+
       setState(() {
         _loading = false;
         _hasError = true;
         _showControls = true;
       });
+
+      _focusNode.requestFocus();
     }
   }
 
@@ -171,7 +183,6 @@ class _PlayerState extends State<Player> {
       _hideTimer?.cancel();
 
       setState(() => _showControls = false);
-
       _focusNode.requestFocus();
     } else {
       setState(() => _showControls = true);
@@ -197,7 +208,12 @@ class _PlayerState extends State<Player> {
     await _initPlayer();
   }
 
+  // Return ONLY to the previous All Channels screen.
+  // Do not use maybePop(), because it may cause unexpected root navigation.
   Future<void> _closePlayer() async {
+    if (_closing) return;
+    _closing = true;
+
     _hideTimer?.cancel();
 
     await SystemChrome.setEnabledSystemUIMode(
@@ -208,8 +224,14 @@ class _PlayerState extends State<Player> {
       DeviceOrientation.values,
     );
 
-    if (mounted) {
-      Navigator.of(context).maybePop();
+    if (!mounted) return;
+
+    if (Navigator.of(context).canPop()) {
+      Navigator.of(context).pop();
+    } else {
+      // Stay in the app if Player was accidentally opened as root.
+      _closing = false;
+      _focusNode.requestFocus();
     }
   }
 
@@ -223,6 +245,7 @@ class _PlayerState extends State<Player> {
 
     final key = event.logicalKey;
 
+    // Back button: close only the streaming player.
     if (key == LogicalKeyboardKey.escape ||
         key == LogicalKeyboardKey.goBack ||
         key == LogicalKeyboardKey.browserBack) {
@@ -237,7 +260,6 @@ class _PlayerState extends State<Player> {
       return KeyEventResult.handled;
     }
 
-    // Allow display-mode menu navigation when controls are visible.
     if (_showControls) {
       return KeyEventResult.ignored;
     }
@@ -266,10 +288,8 @@ class _PlayerState extends State<Player> {
     switch (_screenMode) {
       case _ScreenMode.crop:
         return BoxFit.cover;
-
       case _ScreenMode.stretch:
         return BoxFit.fill;
-
       case _ScreenMode.fit:
       case _ScreenMode.original:
         return BoxFit.contain;
@@ -284,7 +304,6 @@ class _PlayerState extends State<Player> {
     _focusNode.dispose();
 
     final controller = _controller;
-
     controller?.removeListener(_onVideoUpdate);
     controller?.dispose();
 
@@ -308,44 +327,52 @@ class _PlayerState extends State<Player> {
     final ready = controller != null &&
         controller.value.isInitialized;
 
-    return Focus(
-      focusNode: _focusNode,
-      autofocus: true,
-      onKeyEvent: _handleKey,
-      child: Scaffold(
-        backgroundColor: Colors.black,
-        body: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: _toggleControls,
-          child: Stack(
-            alignment: Alignment.center,
-            children: [
-              if (ready)
-                Positioned.fill(
-                  child: ClipRect(
-                    child: FittedBox(
-                      fit: _boxFit,
-                      alignment: Alignment.center,
-                      child: SizedBox(
-                        width: controller.value.size.width,
-                        height: controller.value.size.height,
-                        child: VideoPlayer(controller),
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) {
+          _closePlayer();
+        }
+      },
+      child: Focus(
+        focusNode: _focusNode,
+        autofocus: true,
+        onKeyEvent: _handleKey,
+        child: Scaffold(
+          backgroundColor: Colors.black,
+          body: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: _toggleControls,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                if (ready)
+                  Positioned.fill(
+                    child: ClipRect(
+                      child: FittedBox(
+                        fit: _boxFit,
+                        alignment: Alignment.center,
+                        child: SizedBox(
+                          width: controller.value.size.width,
+                          height: controller.value.size.height,
+                          child: VideoPlayer(controller),
+                        ),
                       ),
                     ),
                   ),
-                ),
 
-              if (_loading)
-                const CircularProgressIndicator(
-                  color: Color(0xFF55D6BE),
-                ),
+                if (_loading)
+                  const CircularProgressIndicator(
+                    color: Color(0xFF55D6BE),
+                  ),
 
-              if (_hasError)
-                _errorPanel(),
+                if (_hasError)
+                  _errorPanel(),
 
-              if (ready && !_hasError && _showControls)
-                _buildOverlay(),
-            ],
+                if (ready && !_hasError && _showControls)
+                  _buildOverlay(),
+              ],
+            ),
           ),
         ),
       ),
@@ -373,6 +400,19 @@ class _PlayerState extends State<Player> {
 
         Positioned(
           top: 16,
+          left: 20,
+          child: Text(
+            _currentChannel.name,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+
+        Positioned(
+          top: 16,
           right: 18,
           child: Row(
             mainAxisSize: MainAxisSize.min,
@@ -391,22 +431,10 @@ class _PlayerState extends State<Player> {
                   _focusNode.requestFocus();
                 },
                 itemBuilder: (_) => [
-                  _modeItem(
-                    _ScreenMode.fit,
-                    'Fit screen',
-                  ),
-                  _modeItem(
-                    _ScreenMode.crop,
-                    'Crop / Zoom',
-                  ),
-                  _modeItem(
-                    _ScreenMode.stretch,
-                    'Stretch',
-                  ),
-                  _modeItem(
-                    _ScreenMode.original,
-                    'Original ratio',
-                  ),
+                  _modeItem(_ScreenMode.fit, 'Fit screen'),
+                  _modeItem(_ScreenMode.crop, 'Crop / Zoom'),
+                  _modeItem(_ScreenMode.stretch, 'Stretch'),
+                  _modeItem(_ScreenMode.original, 'Original ratio'),
                 ],
               ),
 
