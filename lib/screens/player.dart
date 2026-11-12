@@ -1,91 +1,100 @@
 import 'package:chewie/chewie.dart';
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
-import '../model/channel.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
+
+import '../model/channel.dart';
 
 class Player extends StatefulWidget {
   final Channel channel;
 
-  Player({required this.channel});
+  const Player({super.key, required this.channel});
 
   @override
-  _PlayerState createState() => _PlayerState();
+  State<Player> createState() => _PlayerState();
 }
 
 class _PlayerState extends State<Player> {
-  late VideoPlayerController videoPlayerController;
-  late ChewieController chewieController;
+  VideoPlayerController? _videoController;
+  ChewieController? _chewieController;
   bool _isLoading = true;
-  bool _channelNotFound = false;
+  bool _hasError = false;
 
   @override
   void initState() {
     super.initState();
-    videoPlayerController =
-        VideoPlayerController.networkUrl(Uri.parse(widget.channel.streamUrl))
-          ..initialize().then((_) {
-            setState(() {
-              _isLoading = false;
-            });
-          }).catchError((error) {
-            setState(() {
-              _isLoading = false;
-              _channelNotFound = true;
-            });
-          });
+    // Keep the screen awake for as long as the player is open.
+    WakelockPlus.enable();
+    _initPlayer();
+  }
 
-    chewieController = ChewieController(
-      videoPlayerController: videoPlayerController,
-      autoInitialize: true,
-      isLive: true,
-      autoPlay: true,
-      aspectRatio: 3 / 2,
-      showOptions: false,
-      customControls: const MaterialDesktopControls(
-        showPlayButton: false,
-      ),
-    );
+  Future<void> _initPlayer() async {
+    try {
+      final controller = VideoPlayerController.networkUrl(
+        Uri.parse(widget.channel.streamUrl),
+      );
+      _videoController = controller;
+      await controller.initialize();
 
-    // Enable wake lock when video starts playing
-    videoPlayerController.addListener(() {
-      if (videoPlayerController.value.isPlaying) {
-        WakelockPlus.enable();
-      }
-    });
+      // User may have left the screen while the stream was loading.
+      if (!mounted) return;
 
-    // Disable wake lock when video stops
-    videoPlayerController.addListener(() {
-      if (!videoPlayerController.value.isPlaying) {
-        WakelockPlus.disable();
-      }
-    });
+      controller.addListener(_onVideoUpdate);
+      _chewieController = ChewieController(
+        videoPlayerController: controller,
+        autoInitialize: false,
+        isLive: true,
+        autoPlay: true,
+        aspectRatio: 3 / 2,
+        showOptions: false,
+        customControls: const MaterialDesktopControls(
+          showPlayButton: false,
+        ),
+      );
+      setState(() => _isLoading = false);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _isLoading = false;
+        _hasError = true;
+      });
+    }
+  }
+
+  // Show the error message if the stream drops while playing.
+  void _onVideoUpdate() {
+    final controller = _videoController;
+    if (!mounted || controller == null) return;
+    if (controller.value.hasError && !_hasError) {
+      setState(() => _hasError = true);
+    }
   }
 
   @override
   void dispose() {
-    videoPlayerController.dispose();
-    chewieController.dispose();
+    WakelockPlus.disable();
+    _videoController?.removeListener(_onVideoUpdate);
+    // Dispose Chewie first, then the video controller it uses.
+    _chewieController?.dispose();
+    _videoController?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final chewie = _chewieController;
+
     return Scaffold(
-      appBar: AppBar(
-        title: Text(widget.channel.name),
-      ),
+      appBar: AppBar(title: Text(widget.channel.name)),
       body: Center(
         child: _isLoading
             ? const CircularProgressIndicator()
-            : _channelNotFound
+            : (_hasError || chewie == null)
                 ? const Text('Channel not available now',
                     style: TextStyle(fontSize: 24.0))
                 : SizedBox(
                     height: MediaQuery.of(context).size.height * 0.5,
-                    child: Chewie(
-                      controller: chewieController,
-                    ),
+                    child: Chewie(controller: chewie),
                   ),
       ),
     );
