@@ -18,8 +18,6 @@ class _HomeState extends State<Home> {
   List<Channel> filteredChannels = [];
   List<StreamSource> streamSources = [];
 
-  StreamSource? selectedSource;
-
   final TextEditingController searchController =
       TextEditingController();
 
@@ -33,10 +31,12 @@ class _HomeState extends State<Home> {
   @override
   void initState() {
     super.initState();
-    fetchStreamSources();
+    fetchAllChannels();
   }
 
-  Future<void> fetchStreamSources() async {
+  Future<void> fetchAllChannels() async {
+    final loadId = ++_loadId;
+
     setState(() {
       _isLoading = true;
       _hasError = false;
@@ -45,69 +45,53 @@ class _HomeState extends State<Home> {
     try {
       final sources = await channelsProvider.fetchStreamSources();
 
-      if (!mounted) return;
+      if (!mounted || loadId != _loadId) return;
 
-      setState(() {
-        streamSources = sources;
-        _isLoading = false;
-      });
-    } catch (_) {
-      if (!mounted) return;
+      streamSources = sources;
 
-      setState(() {
-        _isLoading = false;
-        _hasError = true;
-      });
-    }
-  }
-
-  Future<void> fetchChannels(StreamSource source) async {
-    final loadId = ++_loadId;
-
-    setState(() {
-      _isLoading = true;
-      _hasError = false;
-      selectedSource = source;
-      searchController.clear();
-    });
-
-    try {
-      final data = await channelsProvider.fetchM3UFile(
-        source.streamUrl,
+      final results = await Future.wait(
+        sources.map((source) async {
+          try {
+            return await channelsProvider.fetchM3UFile(
+              source.streamUrl,
+            );
+          } catch (_) {
+            return <Channel>[];
+          }
+        }),
       );
 
       if (!mounted || loadId != _loadId) return;
 
+      final combinedChannels = <Channel>[];
+      final seenStreams = <String>{};
+
+      for (final channels in results) {
+        for (final channel in channels) {
+          final stream = channel.streamUrl.trim();
+
+          if (stream.isNotEmpty && seenStreams.add(stream)) {
+            combinedChannels.add(channel);
+          }
+        }
+      }
+
       setState(() {
-        allChannels = data;
-        filteredChannels = data;
+        allChannels = combinedChannels;
+        filteredChannels = combinedChannels;
         _isLoading = false;
+        _hasError = combinedChannels.isEmpty;
       });
     } catch (_) {
       if (!mounted || loadId != _loadId) return;
 
       setState(() {
-        selectedSource = null;
         _isLoading = false;
         _hasError = true;
       });
     }
   }
 
-  void backToCategories() {
-    _loadId++;
-
-    setState(() {
-      selectedSource = null;
-      allChannels = [];
-      filteredChannels = [];
-      searchController.clear();
-      _isLoading = false;
-      _hasError = false;
-    });
-  }
-
-  // Exact matches first, followed by prefix and partial matches.
   void filterChannels(String query) {
     final search = query.trim().toLowerCase();
 
@@ -159,24 +143,14 @@ class _HomeState extends State<Home> {
 
   @override
   Widget build(BuildContext context) {
-    return PopScope(
-      canPop: selectedSource == null,
-      onPopInvoked: (didPop) {
-        if (!didPop && selectedSource != null) {
-          backToCategories();
-        }
-      },
-      child: Scaffold(
-        backgroundColor: const Color(0xFF080D16),
-        body: SafeArea(
-          child: _isLoading
-              ? _loadingScreen()
-              : _hasError
-                  ? _errorScreen()
-                  : selectedSource == null
-                      ? _categoryScreen()
-                      : _channelScreen(),
-        ),
+    return Scaffold(
+      backgroundColor: const Color(0xFF080D16),
+      body: SafeArea(
+        child: _isLoading
+            ? _loadingScreen()
+            : _hasError
+                ? _errorScreen()
+                : _channelScreen(),
       ),
     );
   }
@@ -191,7 +165,7 @@ class _HomeState extends State<Home> {
           ),
           SizedBox(height: 18),
           Text(
-            'Loading...',
+            'Loading all channels...',
             style: TextStyle(color: Colors.white70),
           ),
         ],
@@ -213,7 +187,7 @@ class _HomeState extends State<Home> {
             ),
             const SizedBox(height: 16),
             const Text(
-              'Unable to load data',
+              'Unable to load channels',
               style: TextStyle(
                 color: Colors.white,
                 fontSize: 20,
@@ -228,9 +202,7 @@ class _HomeState extends State<Home> {
             ),
             const SizedBox(height: 20),
             FilledButton.icon(
-              onPressed: selectedSource == null
-                  ? fetchStreamSources
-                  : () => fetchChannels(selectedSource!),
+              onPressed: fetchAllChannels,
               icon: const Icon(Icons.refresh),
               label: const Text('Retry'),
             ),
@@ -240,131 +212,43 @@ class _HomeState extends State<Home> {
     );
   }
 
-  Widget _header(String title, String subtitle) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(22, 22, 22, 18),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            title,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 27,
-              fontWeight: FontWeight.w800,
-            ),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            subtitle,
-            style: const TextStyle(
-              color: Colors.white60,
-              fontSize: 14,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _categoryScreen() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _header(
-          'Live TV',
-          'Choose a category to watch your favourite channels',
-        ),
-
-        Expanded(
-          child: streamSources.isEmpty
-              ? const Center(
-                  child: Text(
-                    'No categories available',
-                    style: TextStyle(color: Colors.white70),
-                  ),
-                )
-              : GridView.builder(
-                  padding: const EdgeInsets.fromLTRB(18, 4, 18, 24),
-                  gridDelegate:
-                      const SliverGridDelegateWithMaxCrossAxisExtent(
-                    maxCrossAxisExtent: 320,
-                    mainAxisExtent: 112,
-                    crossAxisSpacing: 14,
-                    mainAxisSpacing: 14,
-                  ),
-                  itemCount: streamSources.length,
-                  itemBuilder: (context, index) {
-                    final source = streamSources[index];
-
-                    return _FocusCard(
-                      onPressed: () => fetchChannels(source),
-                      child: Row(
-                        children: [
-                          const Icon(
-                            Icons.live_tv_rounded,
-                            color: Color(0xFF55D6BE),
-                            size: 32,
-                          ),
-                          const SizedBox(width: 14),
-                          Expanded(
-                            child: Text(
-                              source.name,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 17,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ),
-                          const Icon(
-                            Icons.chevron_right,
-                            color: Colors.white54,
-                          ),
-                        ],
-                      ),
-                    );
-                  },
-                ),
-        ),
-      ],
-    );
-  }
-
   Widget _channelScreen() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Padding(
-          padding: const EdgeInsets.fromLTRB(12, 10, 20, 12),
+          padding: const EdgeInsets.fromLTRB(22, 22, 22, 18),
           child: Row(
             children: [
-              IconButton(
-                tooltip: 'Back to categories',
-                onPressed: backToCategories,
-                color: Colors.white,
-                icon: const Icon(Icons.arrow_back),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  selectedSource!.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 23,
-                    fontWeight: FontWeight.bold,
-                  ),
+              const Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'All Channels',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 27,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    SizedBox(height: 6),
+                    Text(
+                      'Indian TV and Sports in one place',
+                      style: TextStyle(
+                        color: Colors.white60,
+                        fontSize: 14,
+                      ),
+                    ),
+                  ],
                 ),
               ),
-              Text(
-                '${filteredChannels.length} channels',
-                style: const TextStyle(
-                  color: Colors.white60,
-                  fontSize: 12,
+              IconButton(
+                tooltip: 'Refresh channels',
+                onPressed: fetchAllChannels,
+                icon: const Icon(
+                  Icons.refresh,
+                  color: Color(0xFF55D6BE),
                 ),
               ),
             ],
@@ -379,7 +263,7 @@ class _HomeState extends State<Home> {
             textInputAction: TextInputAction.search,
             style: const TextStyle(color: Colors.white),
             decoration: InputDecoration(
-              hintText: 'Search channels...',
+              hintText: 'Search all channels...',
               hintStyle: const TextStyle(color: Colors.white54),
               prefixIcon: const Icon(
                 Icons.search,
@@ -388,7 +272,6 @@ class _HomeState extends State<Home> {
               suffixIcon: searchController.text.isEmpty
                   ? null
                   : IconButton(
-                      tooltip: 'Clear search',
                       onPressed: () {
                         searchController.clear();
                         filterChannels('');
@@ -404,6 +287,17 @@ class _HomeState extends State<Home> {
                 borderRadius: BorderRadius.circular(14),
                 borderSide: BorderSide.none,
               ),
+            ),
+          ),
+        ),
+
+        Padding(
+          padding: const EdgeInsets.fromLTRB(22, 0, 22, 12),
+          child: Text(
+            '${filteredChannels.length} channels available',
+            style: const TextStyle(
+              color: Colors.white60,
+              fontSize: 13,
             ),
           ),
         ),
