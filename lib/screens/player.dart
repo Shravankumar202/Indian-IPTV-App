@@ -1,3 +1,6 @@
+
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
@@ -25,6 +28,8 @@ class _PlayerState extends State<Player> {
   bool _showControls = true;
 
   _ScreenMode _screenMode = _ScreenMode.fit;
+  final FocusNode _focusNode = FocusNode();
+  Timer? _hideTimer;
 
   @override
   void initState() {
@@ -34,25 +39,61 @@ class _PlayerState extends State<Player> {
   }
 
   Future<void> _initPlayer() async {
+    _hideTimer?.cancel();
+
+    final oldController = _videoController;
+    _videoController = null;
+
+    oldController?.removeListener(_onVideoUpdate);
+    await oldController?.dispose();
+
+    if (!mounted) return;
+
+    setState(() {
+      _isLoading = true;
+      _hasError = false;
+      _showControls = true;
+    });
+
+    VideoPlayerController? controller;
+
     try {
-      final controller = VideoPlayerController.networkUrl(
+      controller = VideoPlayerController.networkUrl(
         Uri.parse(widget.channel.streamUrl),
+        httpHeaders: const {
+          'User-Agent': 'Mozilla/5.0',
+        },
       );
 
       _videoController = controller;
 
-      await controller.initialize();
+      await controller.initialize().timeout(
+        const Duration(seconds: 30),
+      );
 
-      if (!mounted) return;
+      if (!mounted || _videoController != controller) {
+        await controller.dispose();
+        return;
+      }
 
       controller.addListener(_onVideoUpdate);
+
+      await controller.setLooping(false);
       await controller.play();
 
       if (!mounted) return;
 
-      setState(() => _isLoading = false);
+      setState(() {
+        _isLoading = false;
+        _hasError = false;
+      });
+
+      _scheduleHideControls();
     } catch (_) {
-      if (!mounted) return;
+      if (!mounted) {
+        await controller?.dispose();
+        return;
+      }
 
       setState(() {
         _isLoading = false;
@@ -67,16 +108,89 @@ class _PlayerState extends State<Player> {
     if (!mounted || controller == null) return;
 
     if (controller.value.hasError && !_hasError) {
-      setState(() => _hasError = true);
-    } else if (controller.value.isInitialized) {
+      setState(() {
+        _hasError = true;
+        _showControls = true;
+      });
+      _hideTimer?.cancel();
+    } else {
       setState(() {});
     }
   }
 
-  Future<void> _toggleFullScreen() async {
-    final next = !_isFullScreen;
+  void _scheduleHideControls() {
+    _hideTimer?.cancel();
 
-    setState(() => _isFullScreen = next);
+    final controller = _videoController;
+
+    if (controller == null || !controller.value.isPlaying) return;
+
+    _hideTimer = Timer(const Duration(seconds: 5), () {
+      if (!mounted) return;
+
+      if (_videoController?.value.isPlaying == true) {
+        setState(() => _showControls = false);
+      }
+    });
+  }
+
+  void _showControlsTemporarily() {
+    if (!mounted) return;
+
+    setState(() => _showControls = true);
+    _scheduleHideControls();
+  }
+
+  Future<void> _togglePlayPause() async {
+    final controller = _videoController;
+
+    if (controller == null || !controller.value.isInitialized) return;
+
+    if (controller.value.isPlaying) {
+      await controller.pause();
+      _hideTimer?.cancel();
+
+      if (mounted) {
+        setState(() => _showControls = true);
+      }
+    } else {
+      await controller.play();
+      _showControlsTemporarily();
+    }
+  }
+
+  Future<void> _seek(int seconds) async {
+    final controller = _videoController;
+
+    if (controller == null || !controller.value.isInitialized) return;
+
+    final current = controller.value.position;
+    final duration = controller.value.duration;
+
+    var target = current + Duration(seconds: seconds);
+
+    if (target < Duration.zero) target = Duration.zero;
+    if (target > duration) target = duration;
+
+    await controller.seekTo(target);
+    _showControlsTemporarily();
+  }
+
+  Future<void> _changeVolume(double amount) async {
+    final controller = _videoController;
+
+    if (controller == null || !controller.value.isInitialized) return;
+
+    final volume = (controller.value.volume + amount).clamp(0.0, 1.0);
+
+    await controller.setVolume(volume);
+    _showControlsTemporarily();
+  }
+
+  Future<void> _toggleFullScreen() async {
+    if (!mounted) return;
+
+    final next = !_isFullScreen;
 
     if (next) {
       await SystemChrome.setEnabledSystemUIMode(
@@ -95,18 +209,26 @@ class _PlayerState extends State<Player> {
       );
 
       await SystemChrome.setPreferredOrientations(
-        const [
-          DeviceOrientation.portraitUp,
-          DeviceOrientation.landscapeLeft,
-          DeviceOrientation.landscapeRight,
-        ],
+        DeviceOrientation.values,
       );
+    }
+
+    if (mounted) {
+      setState(() => _isFullScreen = next);
     }
   }
 
   Future<void> _closePlayer() async {
+    _hideTimer?.cancel();
+
     if (_isFullScreen) {
-      await _toggleFullScreen();
+      await SystemChrome.setEnabledSystemUIMode(
+        SystemUiMode.edgeToEdge,
+      );
+
+      await SystemChrome.setPreferredOrientations(
+        DeviceOrientation.values,
+      );
     }
 
     if (mounted) {
@@ -114,26 +236,51 @@ class _PlayerState extends State<Player> {
     }
   }
 
-  @override
-  void dispose() {
-    WakelockPlus.disable();
+  KeyEventResult _handleKey(
+    FocusNode node,
+    KeyEvent event,
+  ) {
+    if (event is! KeyDownEvent) {
+      return KeyEventResult.ignored;
+    }
 
-    SystemChrome.setEnabledSystemUIMode(
-      SystemUiMode.edgeToEdge,
-    );
+    final key = event.logicalKey;
 
-    SystemChrome.setPreferredOrientations(
-      const [
-        DeviceOrientation.portraitUp,
-        DeviceOrientation.landscapeLeft,
-        DeviceOrientation.landscapeRight,
-      ],
-    );
+    if (key == LogicalKeyboardKey.select ||
+        key == LogicalKeyboardKey.enter ||
+        key == LogicalKeyboardKey.space) {
+      _togglePlayPause();
+      return KeyEventResult.handled;
+    }
 
-    _videoController?.removeListener(_onVideoUpdate);
-    _videoController?.dispose();
+    if (key == LogicalKeyboardKey.arrowRight) {
+      _seek(10);
+      return KeyEventResult.handled;
+    }
 
-    super.dispose();
+    if (key == LogicalKeyboardKey.arrowLeft) {
+      _seek(-10);
+      return KeyEventResult.handled;
+    }
+
+    if (key == LogicalKeyboardKey.arrowUp) {
+      _changeVolume(0.1);
+      return KeyEventResult.handled;
+    }
+
+    if (key == LogicalKeyboardKey.arrowDown) {
+      _changeVolume(-0.1);
+      return KeyEventResult.handled;
+    }
+
+    if (key == LogicalKeyboardKey.escape ||
+        key == LogicalKeyboardKey.goBack) {
+      _closePlayer();
+      return KeyEventResult.handled;
+    }
+
+    _showControlsTemporarily();
+    return KeyEventResult.ignored;
   }
 
   BoxFit get _boxFit {
@@ -162,74 +309,55 @@ class _PlayerState extends State<Player> {
         return 'Stretch';
 
       case _ScreenMode.original:
-        return 'Original';
+        return 'Original ratio';
     }
   }
 
-  KeyEventResult _handleKey(
-    FocusNode node,
-    KeyEvent event,
-  ) {
-    if (event is! KeyDownEvent) {
-      return KeyEventResult.ignored;
+  String _formatDuration(Duration duration) {
+    String two(int value) => value.toString().padLeft(2, '0');
+
+    final hours = duration.inHours;
+    final minutes = duration.inMinutes.remainder(60);
+    final seconds = duration.inSeconds.remainder(60);
+
+    if (hours > 0) {
+      return '$hours:${two(minutes)}:${two(seconds)}';
     }
 
-    final key = event.logicalKey;
+    return '${two(minutes)}:${two(seconds)}';
+  }
 
-    if (key == LogicalKeyboardKey.select ||
-        key == LogicalKeyboardKey.enter ||
-        key == LogicalKeyboardKey.space) {
-      final controller = _videoController;
+  @override
+  void dispose() {
+    _hideTimer?.cancel();
+    _focusNode.dispose();
 
-      if (controller != null &&
-          controller.value.isInitialized) {
-        controller.value.isPlaying
-            ? controller.pause()
-            : controller.play();
+    final controller = _videoController;
+    controller?.removeListener(_onVideoUpdate);
+    controller?.dispose();
 
-        setState(() => _showControls = true);
-      }
+    WakelockPlus.disable();
 
-      return KeyEventResult.handled;
-    }
+    SystemChrome.setEnabledSystemUIMode(
+      SystemUiMode.edgeToEdge,
+    );
 
-    if (key == LogicalKeyboardKey.escape ||
-        key == LogicalKeyboardKey.goBack) {
-      _closePlayer();
-      return KeyEventResult.handled;
-    }
+    SystemChrome.setPreferredOrientations(
+      DeviceOrientation.values,
+    );
 
-    if (key == LogicalKeyboardKey.arrowRight ||
-        key == LogicalKeyboardKey.arrowLeft) {
-      final controller = _videoController;
-
-      if (controller != null &&
-          controller.value.isInitialized) {
-        final delta =
-            key == LogicalKeyboardKey.arrowRight
-                ? const Duration(seconds: 10)
-                : const Duration(seconds: -10);
-
-        final target = controller.value.position + delta;
-
-        controller.seekTo(
-          target < Duration.zero
-              ? Duration.zero
-              : target,
-        );
-      }
-
-      return KeyEventResult.handled;
-    }
-
-    return KeyEventResult.ignored;
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final controller = _videoController;
 
+    final ready = controller != null &&
+        controller.value.isInitialized;
+
     return Focus(
+      focusNode: _focusNode,
       autofocus: true,
       onKeyEvent: _handleKey,
       child: Scaffold(
@@ -238,228 +366,335 @@ class _PlayerState extends State<Player> {
         appBar: _isFullScreen
             ? null
             : AppBar(
+                backgroundColor: const Color(0xFF101827),
+                foregroundColor: Colors.white,
                 title: Text(
                   widget.channel.name,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
-                leading: IconButton(
-                  icon: const Icon(Icons.arrow_back_rounded),
-                  onPressed: _closePlayer,
-                ),
+                actions: [
+                  PopupMenuButton<_ScreenMode>(
+                    tooltip: 'Video display mode',
+                    icon: const Icon(Icons.aspect_ratio),
+                    onSelected: (mode) {
+                      setState(() => _screenMode = mode);
+                    },
+                    itemBuilder: (_) => const [
+                      PopupMenuItem(
+                        value: _ScreenMode.fit,
+                        child: Text('Fit screen'),
+                      ),
+                      PopupMenuItem(
+                        value: _ScreenMode.crop,
+                        child: Text('Crop / Zoom'),
+                      ),
+                      PopupMenuItem(
+                        value: _ScreenMode.stretch,
+                        child: Text('Stretch'),
+                      ),
+                      PopupMenuItem(
+                        value: _ScreenMode.original,
+                        child: Text('Original ratio'),
+                      ),
+                    ],
+                  ),
+                ],
               ),
 
         body: SafeArea(
           top: !_isFullScreen,
           bottom: !_isFullScreen,
-          child: Center(
-            child: _isLoading
-                ? const CircularProgressIndicator()
-                : (_hasError ||
-                        controller == null ||
-                        !controller.value.isInitialized)
-                    ? const Text(
-                        'Channel not available now',
-                        style: TextStyle(
-                          fontSize: 20,
-                          color: Colors.white70,
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: _showControlsTemporarily,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                if (ready)
+                  Positioned.fill(
+                    child: ClipRect(
+                      child: FittedBox(
+                        fit: _boxFit,
+                        alignment: Alignment.center,
+                        child: SizedBox(
+                          width: controller.value.size.width,
+                          height: controller.value.size.height,
+                          child: VideoPlayer(controller),
                         ),
-                      )
-                    : LayoutBuilder(
-                        builder: (context, constraints) {
-                          final videoSize = controller.value.size;
-
-                          final aspect =
-                              videoSize.width > 0 &&
-                                      videoSize.height > 0
-                                  ? videoSize.width /
-                                      videoSize.height
-                                  : 16 / 9;
-
-                          return GestureDetector(
-                            onTap: () {
-                              setState(() {
-                                _showControls = !_showControls;
-                              });
-                            },
-                            child: Stack(
-                              alignment: Alignment.center,
-                              children: [
-                                Positioned.fill(
-                                  child: ClipRect(
-                                    child: FittedBox(
-                                      fit: _boxFit,
-                                      alignment: Alignment.center,
-                                      child: SizedBox(
-                                        width: constraints.maxWidth,
-                                        height: constraints.maxWidth /
-                                            aspect,
-                                        child: VideoPlayer(controller),
-                                      ),
-                                    ),
-                                  ),
-                                ),
-
-                                if (_showControls) ...[
-                                  Positioned.fill(
-                                    child: DecoratedBox(
-                                      decoration: BoxDecoration(
-                                        gradient: LinearGradient(
-                                          begin: Alignment.topCenter,
-                                          end: Alignment.bottomCenter,
-                                          colors: [
-                                            Colors.black.withOpacity(.55),
-                                            Colors.transparent,
-                                            Colors.black.withOpacity(.72),
-                                          ],
-                                          stops: const [0, .45, 1],
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-
-                                  Positioned(
-                                    top: 12,
-                                    left: 16,
-                                    right: 12,
-                                    child: Row(
-                                      children: [
-                                        if (_isFullScreen)
-                                          IconButton(
-                                            onPressed: _toggleFullScreen,
-                                            icon: const Icon(
-                                              Icons.arrow_back_rounded,
-                                              color: Colors.white,
-                                            ),
-                                          ),
-
-                                        Expanded(
-                                          child: Text(
-                                            widget.channel.name,
-                                            style: const TextStyle(
-                                              color: Colors.white,
-                                              fontSize: 18,
-                                              fontWeight: FontWeight.w700,
-                                            ),
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
-                                          ),
-                                        ),
-
-                                        PopupMenuButton<_ScreenMode>(
-                                          tooltip: 'Screen size: $_modeLabel',
-                                          initialValue: _screenMode,
-                                          onSelected: (mode) {
-                                            setState(() {
-                                              _screenMode = mode;
-                                            });
-                                          },
-                                          color: const Color(0xFF182131),
-                                          icon: const Icon(
-                                            Icons.fit_screen_rounded,
-                                            color: Colors.white,
-                                          ),
-                                          itemBuilder: (_) => const [
-                                            PopupMenuItem(
-                                              value: _ScreenMode.fit,
-                                              child: Text('Fit screen'),
-                                            ),
-                                            PopupMenuItem(
-                                              value: _ScreenMode.crop,
-                                              child: Text('Crop / Zoom'),
-                                            ),
-                                            PopupMenuItem(
-                                              value: _ScreenMode.stretch,
-                                              child: Text('Stretch'),
-                                            ),
-                                            PopupMenuItem(
-                                              value: _ScreenMode.original,
-                                              child: Text('Original'),
-                                            ),
-                                          ],
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-
-                                  Center(
-                                    child: IconButton.filled(
-                                      iconSize: 38,
-                                      style: IconButton.styleFrom(
-                                        backgroundColor:
-                                            Colors.black.withOpacity(.55),
-                                        foregroundColor: Colors.white,
-                                        padding: const EdgeInsets.all(18),
-                                      ),
-                                      onPressed: () {
-                                        controller.value.isPlaying
-                                            ? controller.pause()
-                                            : controller.play();
-
-                                        setState(() {});
-                                      },
-                                      icon: Icon(
-                                        controller.value.isPlaying
-                                            ? Icons.pause_rounded
-                                            : Icons.play_arrow_rounded,
-                                      ),
-                                    ),
-                                  ),
-
-                                  Positioned(
-                                    left: 18,
-                                    right: 18,
-                                    bottom: 12,
-                                    child: Column(
-                                      children: [
-                                        VideoProgressIndicator(
-                                          controller,
-                                          allowScrubbing: true,
-                                          colors:
-                                              const VideoProgressColors(
-                                            playedColor:
-                                                Color(0xFF43D9C2),
-                                            bufferedColor: Colors.white38,
-                                            backgroundColor: Colors.white24,
-                                          ),
-                                        ),
-
-                                        const SizedBox(height: 8),
-
-                                        Row(
-                                          children: [
-                                            Text(
-                                              _modeLabel,
-                                              style: const TextStyle(
-                                                color: Colors.white70,
-                                                fontSize: 12,
-                                              ),
-                                            ),
-
-                                            const Spacer(),
-
-                                            IconButton(
-                                              onPressed: _toggleFullScreen,
-                                              icon: Icon(
-                                                _isFullScreen
-                                                    ? Icons.fullscreen_exit_rounded
-                                                    : Icons.fullscreen_rounded,
-                                                color: Colors.white,
-                                                size: 28,
-                                              ),
-                                            ),
-                                          ],
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                ],
-                              ],
-                            ),
-                          );
-                        },
                       ),
+                    ),
+                  ),
+
+                if (_isLoading)
+                  const CircularProgressIndicator(
+                    color: Color(0xFF55D6BE),
+                  ),
+
+                if (_hasError)
+                  _errorPanel(),
+
+                if (ready && !_hasError)
+                  _buildPlaybackControls(controller),
+
+                if (_isFullScreen && _showControls)
+                  Positioned(
+                    top: 8,
+                    left: 8,
+                    child: IconButton(
+                      onPressed: _closePlayer,
+                      color: Colors.white,
+                      icon: const Icon(Icons.arrow_back),
+                    ),
+                  ),
+              ],
+            ),
           ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPlaybackControls(VideoPlayerController controller) {
+    return AnimatedOpacity(
+      opacity: _showControls ? 1 : 0,
+      duration: const Duration(milliseconds: 250),
+      child: IgnorePointer(
+        ignoring: !_showControls,
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Colors.black.withOpacity(0.65),
+                      Colors.transparent,
+                      Colors.black.withOpacity(0.8),
+                    ],
+                    stops: const [0, 0.5, 1],
+                  ),
+                ),
+              ),
+            ),
+
+            Positioned(
+              top: 10,
+              left: 16,
+              right: 12,
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      widget.channel.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+
+                  PopupMenuButton<_ScreenMode>(
+                    tooltip: _modeLabel,
+                    color: const Color(0xFF182131),
+                    icon: const Icon(
+                      Icons.aspect_ratio,
+                      color: Colors.white,
+                    ),
+                    onSelected: (mode) {
+                      setState(() => _screenMode = mode);
+                      _scheduleHideControls();
+                    },
+                    itemBuilder: (_) => const [
+                      PopupMenuItem(
+                        value: _ScreenMode.fit,
+                        child: Text('Fit screen'),
+                      ),
+                      PopupMenuItem(
+                        value: _ScreenMode.crop,
+                        child: Text('Crop / Zoom'),
+                      ),
+                      PopupMenuItem(
+                        value: _ScreenMode.stretch,
+                        child: Text('Stretch'),
+                      ),
+                      PopupMenuItem(
+                        value: _ScreenMode.original,
+                        child: Text('Original ratio'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+
+            Center(
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    onPressed: () => _seek(-10),
+                    iconSize: 38,
+                    color: Colors.white,
+                    icon: const Icon(Icons.replay_10),
+                  ),
+
+                  const SizedBox(width: 18),
+
+                  IconButton.filled(
+                    autofocus: true,
+                    onPressed: _togglePlayPause,
+                    iconSize: 42,
+                    style: IconButton.styleFrom(
+                      backgroundColor: const Color(0xFF55D6BE),
+                      foregroundColor: Colors.black,
+                      padding: const EdgeInsets.all(15),
+                    ),
+                    icon: Icon(
+                      controller.value.isPlaying
+                          ? Icons.pause
+                          : Icons.play_arrow,
+                    ),
+                  ),
+
+                  const SizedBox(width: 18),
+
+                  IconButton(
+                    onPressed: () => _seek(10),
+                    iconSize: 38,
+                    color: Colors.white,
+                    icon: const Icon(Icons.forward_10),
+                  ),
+                ],
+              ),
+            ),
+
+            Positioned(
+              left: 18,
+              right: 18,
+              bottom: 12,
+              child: Column(
+                children: [
+                  VideoProgressIndicator(
+                    controller,
+                    allowScrubbing: true,
+                    colors: const VideoProgressColors(
+                      playedColor: Color(0xFF55D6BE),
+                      bufferedColor: Colors.white38,
+                      backgroundColor: Colors.white24,
+                    ),
+                  ),
+
+                  const SizedBox(height: 8),
+
+                  Row(
+                    children: [
+                      Text(
+                        '${_formatDuration(controller.value.position)} / ${_formatDuration(controller.value.duration)}',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                        ),
+                      ),
+
+                      const Spacer(),
+
+                      Text(
+                        'Vol ${(controller.value.volume * 100).round()}%',
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 12,
+                        ),
+                      ),
+
+                      IconButton(
+                        tooltip: 'Volume down',
+                        onPressed: () => _changeVolume(-0.1),
+                        color: Colors.white,
+                        icon: const Icon(Icons.volume_down),
+                      ),
+
+                      IconButton(
+                        tooltip: 'Volume up',
+                        onPressed: () => _changeVolume(0.1),
+                        color: Colors.white,
+                        icon: const Icon(Icons.volume_up),
+                      ),
+
+                      IconButton(
+                        tooltip: 'Full screen',
+                        onPressed: _toggleFullScreen,
+                        color: Colors.white,
+                        icon: Icon(
+                          _isFullScreen
+                              ? Icons.fullscreen_exit
+                              : Icons.fullscreen,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _errorPanel() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.signal_wifi_connected_no_internet_4,
+              color: Colors.white70,
+              size: 55,
+            ),
+
+            const SizedBox(height: 16),
+
+            const Text(
+              'Channel is temporarily unavailable',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 20,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+
+            const SizedBox(height: 10),
+
+            const Text(
+              'Check your internet connection or try again.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.white70),
+            ),
+
+            const SizedBox(height: 22),
+
+            FilledButton.icon(
+              onPressed: _initPlayer,
+              icon: const Icon(Icons.refresh),
+              label: const Text('Retry channel'),
+            ),
+
+            const SizedBox(height: 8),
+
+            TextButton(
+              onPressed: _closePlayer,
+              child: const Text('Back to channels'),
+            ),
+          ],
         ),
       ),
     );
